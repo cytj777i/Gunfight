@@ -1,0 +1,604 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+local TextService = game:GetService("TextService")
+
+-- 武器系统路径（基于抓包数据）
+local WeaponsSystem = ReplicatedStorage:WaitForChild("WeaponsSystem")
+local WeaponsNetwork = WeaponsSystem:WaitForChild("Network")
+local WeaponFired = WeaponsNetwork:WaitForChild("WeaponFired")
+local WeaponHit = WeaponsNetwork:WaitForChild("WeaponHit")
+local WeaponReload = WeaponsNetwork:WaitForChild("WeaponReloadRequest")
+
+-- 其他系统（基于抓包数据）
+local Events = ReplicatedStorage:WaitForChild("Events")
+local PingData = Events:WaitForChild("PingData")
+local ClientLogging = ReplicatedStorage:WaitForChild("ClientLogging")
+
+-- 配置
+local CONFIG = {
+    ATTACK_RANGE = 500,
+    USE_REALISTIC_DATA = true,
+    ATTACK_ALL_PLAYERS = true,
+    ATTACK_INTERVAL = 1 -- 每秒攻击一次
+}
+
+-- 全局变量
+local isAttacking = false
+local attackConnection = nil
+local currentWeapons = {}
+local shotIdCounter = 1
+local rangeInputVisible = false
+local uiVisible = true
+local lastAttackTime = 0
+
+-- 缓存玩家数据以提高性能
+local playerCache = {}
+
+-- 基于抓包数据的武器列表
+local WEAPON_TYPES = {
+    "AR", "Sniper", "SMG", "Pistol", "Crossbow"
+}
+
+-- 基于抓包数据的材质列表
+local MATERIALS = {
+    Enum.Material.Concrete,
+    Enum.Material.Grass, 
+    Enum.Material.Wood,
+    Enum.Material.Plastic
+}
+
+-- 获取当前所有武器（基于抓包数据的武器名称）
+function getCurrentWeapons()
+    local weapons = {}
+    local character = LocalPlayer.Character
+
+    if character then
+        for _, weaponName in pairs(WEAPON_TYPES) do
+            local weapon = character:FindFirstChild(weaponName)
+            if weapon then
+                table.insert(weapons, weapon)
+            end
+        end
+    end
+
+    local backpack = LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        for _, weaponName in pairs(WEAPON_TYPES) do
+            local weapon = backpack:FindFirstChild(weaponName)
+            if weapon then
+                table.insert(weapons, weapon)
+            end
+        end
+    end
+
+    return weapons
+end
+
+-- 实时获取范围内所有玩家（优化版本）
+function getPlayersInRange()
+    local playersInRange = {}
+    local character = LocalPlayer.Character
+    local maxDistance = 0
+    local farthestPlayer = nil
+
+    if not character then return playersInRange, farthestPlayer, maxDistance end
+
+    local humanoidRootPart = character:FindFirstChild("HumanoidRootPart")
+    if not humanoidRootPart then return playersInRange, farthestPlayer, maxDistance end
+
+    local currentTime = tick()
+
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local cacheKey = tostring(player.UserId)
+            local cacheData = playerCache[cacheKey]
+
+            if cacheData and (currentTime - cacheData.lastUpdate < 0.1) then
+                if cacheData.inRange and cacheData.alive then
+                    table.insert(playersInRange, cacheData)
+                    if cacheData.distance > maxDistance then
+                        maxDistance = cacheData.distance
+                        farthestPlayer = player
+                    end
+                end
+            else
+                local inRange = false
+                local alive = false
+                local distance = 0
+                local targetHRP = nil
+
+                if player.Character then
+                    targetHRP = player.Character:FindFirstChild("HumanoidRootPart")
+                    local humanoid = player.Character:FindFirstChild("Humanoid")
+
+                    if targetHRP and humanoid then
+                        distance = (targetHRP.Position - humanoidRootPart.Position).Magnitude
+                        inRange = distance <= CONFIG.ATTACK_RANGE
+                        alive = humanoid.Health > 0
+                    end
+                end
+
+                playerCache[cacheKey] = {
+                    player = player,
+                    distance = distance,
+                    humanoidRootPart = targetHRP,
+                    inRange = inRange,
+                    alive = alive,
+                    lastUpdate = currentTime
+                }
+
+                if inRange and alive then
+                    table.insert(playersInRange, playerCache[cacheKey])
+                    if distance > maxDistance then
+                        maxDistance = distance
+                        farthestPlayer = player
+                    end
+                end
+            end
+        end
+    end
+
+    return playersInRange, farthestPlayer, maxDistance
+end
+
+-- 基于抓包数据生成真实的数据包
+function generateRealisticPackets(targetPlayer, weapon)
+    if not targetPlayer or not targetPlayer.Character then return nil, nil end
+
+    local character = LocalPlayer.Character
+    local targetCharacter = targetPlayer.Character
+    local humanoidRootPart = character and character:FindFirstChild("HumanoidRootPart")
+    local targetHRP = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+
+    if not humanoidRootPart or not targetHRP then return nil, nil end
+
+    local origin = humanoidRootPart.Position
+    local targetPos = targetHRP.Position
+
+    -- 基于抓包数据的随机偏移
+    local randomOffset = Vector3.new(
+        math.random(-50, 50) / 1000,
+        math.random(-50, 50) / 1000, 
+        math.random(-50, 50) / 1000
+    )
+
+    local direction = (targetPos - origin + randomOffset).Unit
+    local hitPosition = targetPos + randomOffset * 2
+
+    -- 射击ID递增（基于抓包数据的ID范围）
+    local shotId = shotIdCounter
+    shotIdCounter = shotIdCounter + 1
+    if shotIdCounter > 100 then shotIdCounter = 1 end
+
+    -- 基于抓包数据的武器特定参数
+    local charge = 0
+    if weapon.Name == "Crossbow" then
+        charge = 1  -- 基于抓包数据，十字弩有charge=1
+    end
+
+    -- 构建开火数据包（基于抓包数据格式）
+    local firePacket = {
+        id = shotId,
+        charge = charge,
+        origin = Vector3.new(origin.X, origin.Y, origin.Z),
+        dir = Vector3.new(direction.X, direction.Y, direction.Z)
+    }
+
+    -- 基于抓包数据的命中包参数
+    local distance = (hitPosition - origin).Magnitude
+    local maxDist = distance + math.random(1, 5)
+
+    -- 随机选择材质（基于抓包数据）
+    local randomMaterial = MATERIALS[math.random(1, #MATERIALS)]
+
+    -- 构建命中数据包（基于抓包数据格式）
+    local hitPacket = {
+        p = Vector3.new(hitPosition.X, hitPosition.Y, hitPosition.Z),
+        pid = targetPlayer.UserId,
+        part = targetHRP,
+        d = distance,
+        maxDist = maxDist,
+        h = targetHRP,
+        m = randomMaterial,
+        n = Vector3.new(0, 1, 0),  -- 基于抓包数据，法线通常是Vector3.yAxis
+        t = tick(),
+        sid = shotId
+    }
+
+    return firePacket, hitPacket
+end
+
+-- 基于抓包数据的Ping数据发送
+function sendPingData()
+    local args = {
+        "Ping",
+        math.random(80, 120) / 1000  -- 基于抓包数据的ping值范围
+    }
+    pcall(function()
+        PingData:FireServer(unpack(args))
+    end)
+end
+
+-- 基于抓包数据的客户端日志发送
+function sendClientLogging()
+    local args = {{}}  -- 基于抓包数据，空表
+    pcall(function()
+        ClientLogging:FireServer(unpack(args))
+    end)
+end
+
+-- 基于抓包数据的武器重新装填
+function sendWeaponReload(weapon)
+    local args = {weapon}
+    pcall(function()
+        WeaponReload:FireServer(unpack(args))
+    end)
+end
+
+-- 每秒攻击一次所有玩家
+function executeOneSecondAttack()
+    if not isAttacking then return end
+
+    local currentTime = tick()
+    if currentTime - lastAttackTime < CONFIG.ATTACK_INTERVAL then
+        return
+    end
+
+    lastAttackTime = currentTime
+
+    local playersInRange, farthestPlayer, maxDistance = getPlayersInRange()
+    if #playersInRange == 0 then return end
+
+    local weapons = getCurrentWeapons()
+    if #weapons == 0 then return end
+
+    -- 对每个玩家和每个武器同时发送攻击包
+    for _, targetData in pairs(playersInRange) do
+        local targetPlayer = targetData.player
+
+        if targetData.alive then
+            for _, weapon in pairs(weapons) do
+                local firePacket, hitPacket = generateRealisticPackets(targetPlayer, weapon)
+
+                if firePacket and hitPacket then
+                    -- 发送武器开火包
+                    pcall(function()
+                        local args = {weapon, firePacket}
+                        WeaponFired:FireServer(unpack(args))
+                    end)
+
+                    -- 发送武器命中包
+                    pcall(function()
+                        local args = {weapon, hitPacket}
+                        WeaponHit:FireServer(unpack(args))
+                    end)
+
+                    -- 基于抓包数据的重新装填频率
+                    if math.random(1, 20) == 1 then
+                        sendWeaponReload(weapon)
+                    end
+                end
+            end
+        end
+    end
+
+    -- 基于抓包数据的Ping发送频率
+    if math.random(1, 3) == 1 then
+        sendPingData()
+    end
+
+    -- 基于抓包数据的客户端日志发送频率
+    if math.random(1, 10) == 1 then
+        sendClientLogging()
+    end
+end
+
+-- 开始每秒攻击循环
+function startOneSecondAttack()
+    if attackConnection then
+        attackConnection:Disconnect()
+    end
+
+    attackConnection = RunService.Heartbeat:Connect(function()
+        if not isAttacking then return end
+        pcall(executeOneSecondAttack)
+    end)
+end
+
+-- 创建UI（完全按照参考脚本的样式）
+function createUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "AttackSystemGUI"
+    screenGui.Parent = game:GetService("CoreGui")
+
+    -- 主界面
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 300, 0, 200)
+    mainFrame.Position = UDim2.new(0, 10, 0, 10)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    mainFrame.BorderSizePixel = 1
+    mainFrame.BorderColor3 = Color3.fromRGB(80, 80, 100)
+    mainFrame.Active = true
+    mainFrame.Draggable = true
+    mainFrame.Visible = uiVisible
+    mainFrame.Parent = screenGui
+
+    -- 标题栏
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 25)
+    titleBar.Position = UDim2.new(0, 0, 0, 0)
+    titleBar.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = mainFrame
+
+    -- 标题
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(0.8, 0, 1, 0)
+    titleLabel.Position = UDim2.new(0, 5, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "XTTT堡垒之夜全局秒杀"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 12
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = titleBar
+
+    -- 关闭按钮
+    local closeButton = Instance.new("TextButton")
+    closeButton.Size = UDim2.new(0, 20, 0, 20)
+    closeButton.Position = UDim2.new(1, -25, 0, 2)
+    closeButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    closeButton.BorderSizePixel = 0
+    closeButton.Text = "X"
+    closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = 12
+    closeButton.Parent = titleBar
+
+    -- 开关按钮
+    local toggleButton = Instance.new("TextButton")
+    toggleButton.Size = UDim2.new(0.9, 0, 0, 30)
+    toggleButton.Position = UDim2.new(0.05, 0, 0.15, 0)
+    toggleButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    toggleButton.Text = "启动每秒攻击"
+    toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleButton.Font = Enum.Font.Gotham
+    toggleButton.TextSize = 12
+    toggleButton.Parent = mainFrame
+
+    -- 范围调节按钮
+    local rangeButton = Instance.new("TextButton")
+    rangeButton.Size = UDim2.new(0.9, 0, 0, 25)
+    rangeButton.Position = UDim2.new(0.05, 0, 0.35, 0)
+    rangeButton.BackgroundColor3 = Color3.fromRGB(60, 100, 180)
+    rangeButton.Text = "设置攻击范围: " .. CONFIG.ATTACK_RANGE .. "米"
+    rangeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    rangeButton.Font = Enum.Font.Gotham
+    rangeButton.TextSize = 11
+    rangeButton.Parent = mainFrame
+
+    -- 状态显示
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(0.9, 0, 0, 80)
+    statusLabel.Position = UDim2.new(0.05, 0, 0.55, 0)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "状态: 待机\n范围: " .. CONFIG.ATTACK_RANGE .. "米\n攻击间隔: 1秒\n目标数量: 0\n最远目标: 无"
+    statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextSize = 11
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+    statusLabel.Parent = mainFrame
+
+    -- 范围输入框
+    local rangeInputFrame = Instance.new("Frame")
+    rangeInputFrame.Size = UDim2.new(0.9, 0, 0, 80)
+    rangeInputFrame.Position = UDim2.new(0.05, 0, 0.15, 0)
+    rangeInputFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    rangeInputFrame.BorderSizePixel = 1
+    rangeInputFrame.BorderColor3 = Color3.fromRGB(100, 100, 120)
+    rangeInputFrame.Visible = false
+    rangeInputFrame.Parent = mainFrame
+
+    local rangeInputLabel = Instance.new("TextLabel")
+    rangeInputLabel.Size = UDim2.new(1, 0, 0, 25)
+    rangeInputLabel.Position = UDim2.new(0, 0, 0, 0)
+    rangeInputLabel.BackgroundTransparency = 1
+    rangeInputLabel.Text = "输入攻击范围（米）:"
+    rangeInputLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    rangeInputLabel.Font = Enum.Font.Gotham
+    rangeInputLabel.TextSize = 11
+    rangeInputLabel.Parent = rangeInputFrame
+
+    local rangeTextBox = Instance.new("TextBox")
+    rangeTextBox.Size = UDim2.new(0.9, 0, 0, 25)
+    rangeTextBox.Position = UDim2.new(0.05, 0, 0.35, 0)
+    rangeTextBox.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+    rangeTextBox.BorderSizePixel = 0
+    rangeTextBox.Text = tostring(CONFIG.ATTACK_RANGE)
+    rangeTextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    rangeTextBox.Font = Enum.Font.Gotham
+    rangeTextBox.TextSize = 12
+    rangeTextBox.PlaceholderText = "输入范围（1-1000）"
+    rangeTextBox.Parent = rangeInputFrame
+
+    local confirmRangeButton = Instance.new("TextButton")
+    confirmRangeButton.Size = UDim2.new(0.4, 0, 0, 25)
+    confirmRangeButton.Position = UDim2.new(0.05, 0, 0.7, 0)
+    confirmRangeButton.BackgroundColor3 = Color3.fromRGB(60, 180, 60)
+    confirmRangeButton.Text = "确认"
+    confirmRangeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    confirmRangeButton.Font = Enum.Font.Gotham
+    confirmRangeButton.TextSize = 11
+    confirmRangeButton.Parent = rangeInputFrame
+
+    local cancelRangeButton = Instance.new("TextButton")
+    cancelRangeButton.Size = UDim2.new(0.4, 0, 0, 25)
+    cancelRangeButton.Position = UDim2.new(0.55, 0, 0.7, 0)
+    cancelRangeButton.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+    cancelRangeButton.Text = "取消"
+    cancelRangeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    cancelRangeButton.Font = Enum.Font.Gotham
+    cancelRangeButton.TextSize = 11
+    cancelRangeButton.Parent = rangeInputFrame
+
+    -- 最小化按钮（加大到原来的两倍）
+    local minimizeButton = Instance.new("TextButton")
+    minimizeButton.Size = UDim2.new(0, 40, 0, 40)
+    minimizeButton.Position = UDim2.new(0, 10, 0, 10)
+    minimizeButton.BackgroundColor3 = Color3.fromRGB(60, 100, 180)
+    minimizeButton.BorderSizePixel = 0
+    minimizeButton.Text = "•"
+    minimizeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minimizeButton.Font = Enum.Font.GothamBold
+    minimizeButton.TextSize = 24
+    minimizeButton.Visible = not uiVisible
+    minimizeButton.Active = true
+    minimizeButton.Draggable = true
+    minimizeButton.Parent = screenGui
+
+    -- 更新状态显示
+    local function updateStatus()
+        local playersInRange, farthestPlayer, maxDistance = getPlayersInRange()
+        local targetCount = #playersInRange
+        local farthestText = farthestPlayer and (farthestPlayer.Name .. " (" .. string.format("%.1f米", maxDistance) .. ")") or "无"
+        local statusText = isAttacking and "每秒攻击中" or "待机"
+
+        statusLabel.Text = string.format("状态: %s\n范围: %d米\n攻击间隔: 1秒\n目标数量: %d\n最远目标: %s", 
+            statusText,
+            CONFIG.ATTACK_RANGE,
+            targetCount,
+            farthestText
+        )
+    end
+
+    -- 切换范围输入框显示
+    local function toggleRangeInput()
+        rangeInputVisible = not rangeInputVisible
+        rangeInputFrame.Visible = rangeInputVisible
+        toggleButton.Visible = not rangeInputVisible
+        rangeButton.Visible = not rangeInputVisible
+        statusLabel.Visible = not rangeInputVisible
+
+        if rangeInputVisible then
+            rangeTextBox.Text = tostring(CONFIG.ATTACK_RANGE)
+            rangeTextBox:CaptureFocus()
+        end
+    end
+
+    -- 应用新的攻击范围
+    local function applyNewRange()
+        local newRange = tonumber(rangeTextBox.Text)
+        if newRange and newRange > 0 and newRange <= 1000 then
+            CONFIG.ATTACK_RANGE = math.floor(newRange)
+            rangeButton.Text = "设置攻击范围: " .. CONFIG.ATTACK_RANGE .. "米"
+            playerCache = {}
+            updateStatus()
+            toggleRangeInput()
+        else
+            rangeTextBox.Text = "无效范围!"
+            wait(1)
+            rangeTextBox.Text = tostring(CONFIG.ATTACK_RANGE)
+        end
+    end
+
+    -- 切换UI显示/隐藏
+    local function toggleUI()
+        uiVisible = not uiVisible
+        mainFrame.Visible = uiVisible
+        minimizeButton.Visible = not uiVisible
+    end
+
+    -- 按钮事件
+    toggleButton.MouseButton1Click:Connect(function()
+        isAttacking = not isAttacking
+
+        if isAttacking then
+            toggleButton.BackgroundColor3 = Color3.fromRGB(60, 200, 60)
+            toggleButton.Text = "停止每秒攻击"
+            startOneSecondAttack()
+        else
+            toggleButton.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+            toggleButton.Text = "启动每秒攻击"
+        end
+
+        updateStatus()
+    end)
+
+    rangeButton.MouseButton1Click:Connect(function()
+        toggleRangeInput()
+    end)
+
+    confirmRangeButton.MouseButton1Click:Connect(function()
+        applyNewRange()
+    end)
+
+    cancelRangeButton.MouseButton1Click:Connect(function()
+        toggleRangeInput()
+    end)
+
+    closeButton.MouseButton1Click:Connect(function()
+        toggleUI()
+    end)
+
+    minimizeButton.MouseButton1Click:Connect(function()
+        toggleUI()
+    end)
+
+    rangeTextBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            applyNewRange()
+        end
+    end)
+
+    -- 实时状态更新
+    local statusUpdateConnection
+    statusUpdateConnection = RunService.Heartbeat:Connect(function()
+        pcall(updateStatus)
+    end)
+
+    return screenGui
+end
+
+-- 玩家加入事件监听
+Players.PlayerAdded:Connect(function(player)
+    print("新玩家加入:", player.Name)
+    playerCache = {}
+end)
+
+-- 玩家离开事件监听
+Players.PlayerRemoving:Connect(function(player)
+    print("玩家离开:", player.Name)
+    playerCache[tostring(player.UserId)] = nil
+end)
+
+-- 角色变化时清除缓存
+LocalPlayer.CharacterAdded:Connect(function(character)
+    playerCache = {}
+end)
+
+-- 初始化
+pcall(function()
+    createUI()
+    print("基于抓包数据的攻击系统已加载")
+    print("初始攻击范围: " .. CONFIG.ATTACK_RANGE .. "米")
+    print("攻击间隔: 1秒")
+    print("模式: 每秒攻击范围内所有玩家")
+    print("武器类型: AR, Sniper, SMG, Pistol, Crossbow")
+    print("按 F 键快速切换攻击状态")
+end)
+
+-- 键盘控制
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.F then
+        isAttacking = not isAttacking
+        if isAttacking then
+            startOneSecondAttack()
+        end
+    end
+end)
